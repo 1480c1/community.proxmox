@@ -43,7 +43,8 @@ options:
     description:
       - Proxmox VE API user (for example V(root@pam)).
       - Used with O(api_password) to obtain an authentication ticket.
-      - Mutually exclusive with O(api_token_id).
+      - Alternatively used with O(api_token_id) and O(api_token_secret) for token-based authentication.
+    required: true
     type: str
     vars:
       - name: proxmox_api_user
@@ -60,9 +61,8 @@ options:
       - name: PROXMOX_PASSWORD
   api_token_id:
     description:
-      - API token ID (for example V(user@pam!token_name)).
-      - Used with O(api_token_secret).
-      - Mutually exclusive with O(api_user).
+      - API token ID (for example V(token_name)).
+      - Used with O(api_user) and O(api_token_secret).
     type: str
     vars:
       - name: proxmox_api_token_id
@@ -301,12 +301,12 @@ class Connection(ConnectionBase):
         user = self.get_option("api_user")
         password = self.get_option("api_password")
 
-        if token_id and token_secret:
+        if user and token_id and token_secret:
             self._proxmox = ProxmoxAPI(
                 host,
                 port=port,
-                user=token_id.split("!")[0],
-                token_name=token_id.split("!")[-1],
+                user=user,
+                token_name=token_id,
                 token_value=token_secret,
                 verify_ssl=verify_ssl,
             )
@@ -320,7 +320,7 @@ class Connection(ConnectionBase):
             )
         else:
             raise AnsibleConnectionFailure(
-                "No authentication configured. Provide api_token_id + api_token_secret, or api_user + api_password."
+                "No authentication configured. Provide api_user + api_token_id + api_token_secret, or api_user + api_password."
             )
 
         return self._proxmox

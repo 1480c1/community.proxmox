@@ -6,7 +6,7 @@
   ansible.builtin.set_fact:
     environment_auth_vars:
       PROXMOX_HOST: "{{ api_host }}"
-      PROXMOX_USER: "{{ api_user | default(omit)}}"
+      PROXMOX_USER: "{{ api_user | default(omit) }}"
       PROXMOX_PASSWORD: "{{ api_password | default(omit) }}"
       PROXMOX_VALIDATE_CERTS: "{{ validate_certs | default(omit) }}"
       PROXMOX_TOKEN_ID: "{{ api_token_id | default(omit) }}"
