@@ -22,6 +22,7 @@ TEST_API_PORT = 8006
 TEST_NODE = "pve-1"
 TEST_VMID = 100
 TEST_CONNECT_TIMEOUT = 60
+FILE_WRITE_CHUNK = qemu_module.FILE_WRITE_CHUNK
 
 
 @pytest.fixture
@@ -38,7 +39,8 @@ def connection():
     conn.set_option("vmid", TEST_VMID)
     conn.set_option("validate_certs", True)
     conn.set_option("remote_tmp", "/tmp")
-    conn.set_option("executable", "/bin/sh")
+    conn.set_option("guest_os", "posix")
+    conn.set_option("guest_shell", "auto")
     conn.set_option("connect_timeout", TEST_CONNECT_TIMEOUT)
     return conn
 
@@ -51,7 +53,8 @@ def test_connection_options(connection):
     assert connection.get_option("vmid") == TEST_VMID
     assert connection.get_option("validate_certs") is True
     assert connection.get_option("remote_tmp") == "/tmp"
-    assert connection.get_option("executable") == "/bin/sh"
+    assert connection.get_option("guest_os") == "posix"
+    assert connection.get_option("guest_shell") == "auto"
     assert connection.get_option("connect_timeout") == TEST_CONNECT_TIMEOUT
 
 
@@ -384,10 +387,10 @@ def test_put_file_chunked_uses_remote_tmp(mock_api, mock_sleep, connection):
     with patch("builtins.open", mock_open(read_data=large_data)):
         connection.put_file("/local/path", "/remote/path")
 
-    # Check that the cat command references /var/tmp
+    # Check that the cat command references /var/tmp with zero-padded part names
     exec_call = agent.exec.post.call_args
     cmd = exec_call[1]["command"][2]
-    assert "/var/tmp/.ansible_part_" in cmd
+    assert "/var/tmp/.ansible_part_000000" in cmd
 
 
 @patch.object(qemu_module.time, "sleep")
@@ -420,20 +423,15 @@ def test_fetch_file_small(mock_api, mock_sleep, connection):
     connection._proxmox = mock_proxmox
 
     agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
-    agent("file-read").get.return_value = {"content": "hello world"}
+    agent("file-read").get.return_value = {"content": "hello world", "truncated": False}
 
-    with patch.object(connection, "exec_command") as mock_exec:
-        mock_exec.side_effect = [
-            (0, "", ""),  # split
-            (0, "/tmp/.ansible_fetch_aa\n", ""),  # ls
-            (0, "", ""),  # rm
-        ]
-        m = mock_open()
-        with patch("builtins.open", m):
-            connection.fetch_file("/remote/path", "/local/path")
+    m = mock_open()
+    with patch("builtins.open", m):
+        connection.fetch_file("/remote/path", "/local/path")
 
     m.assert_called_with("/local/path", "wb")
     m().write.assert_called_once_with(b"hello world")
+    agent("file-read").get.assert_called_once_with(file="/remote/path", offset=0, count=FILE_WRITE_CHUNK)
 
 
 @patch.object(qemu_module.time, "sleep")
@@ -445,25 +443,19 @@ def test_fetch_file_chunked(mock_api, mock_sleep, connection):
     connection._connected = True
     connection._proxmox = mock_proxmox
 
-    chunk_a = "a" * 45000
-    chunk_b = "b" * 45000
+    chunk_a = "a" * FILE_WRITE_CHUNK
+    chunk_b = "b" * FILE_WRITE_CHUNK
     chunk_c = "c" * 10000
     agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
     agent("file-read").get.side_effect = [
-        {"content": chunk_a},
-        {"content": chunk_b},
-        {"content": chunk_c},
+        {"content": chunk_a, "truncated": True},
+        {"content": chunk_b, "truncated": True},
+        {"content": chunk_c, "truncated": False},
     ]
 
-    with patch.object(connection, "exec_command") as mock_exec:
-        mock_exec.side_effect = [
-            (0, "", ""),  # split
-            (0, "/tmp/.ansible_fetch_aa\n/tmp/.ansible_fetch_ab\n/tmp/.ansible_fetch_ac\n", ""),  # ls
-            (0, "", ""),  # rm
-        ]
-        m = mock_open()
-        with patch("builtins.open", m):
-            connection.fetch_file("/remote/path", "/local/path")
+    m = mock_open()
+    with patch("builtins.open", m):
+        connection.fetch_file("/remote/path", "/local/path")
 
     assert agent("file-read").get.call_count == 3  # noqa: PLR2004
     calls = m().write.call_args_list
@@ -484,17 +476,11 @@ def test_fetch_file_binary(mock_api, mock_sleep, connection):
 
     binary_as_str = "".join(chr(i) for i in range(256))
     agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
-    agent("file-read").get.return_value = {"content": binary_as_str}
+    agent("file-read").get.return_value = {"content": binary_as_str, "truncated": False}
 
-    with patch.object(connection, "exec_command") as mock_exec:
-        mock_exec.side_effect = [
-            (0, "", ""),  # split
-            (0, "/tmp/.ansible_fetch_aa\n", ""),  # ls
-            (0, "", ""),  # rm
-        ]
-        m = mock_open()
-        with patch("builtins.open", m):
-            connection.fetch_file("/remote/path", "/local/path")
+    m = mock_open()
+    with patch("builtins.open", m):
+        connection.fetch_file("/remote/path", "/local/path")
 
     written = m().write.call_args[0][0]
     assert written == bytes(range(256))
@@ -502,28 +488,31 @@ def test_fetch_file_binary(mock_api, mock_sleep, connection):
 
 @patch.object(qemu_module.time, "sleep")
 @patch.object(qemu_module, "ProxmoxAPI")
-def test_fetch_file_split_failure(mock_api, mock_sleep, connection):
-    """Test that fetch fails if split command fails."""
+def test_fetch_file_read_failure(mock_api, mock_sleep, connection):
+    """Test that fetch fails if file-read API call fails."""
     mock_proxmox = MagicMock()
     mock_api.return_value = mock_proxmox
     connection._connected = True
     connection._proxmox = mock_proxmox
 
-    with patch.object(connection, "exec_command") as mock_exec:
-        mock_exec.return_value = (1, "", "No such file")
-        with pytest.raises(AnsibleConnectionFailure, match="Failed to split file"):
-            connection.fetch_file("/remote/path", "/local/path")
+    agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
+    agent("file-read").get.side_effect = Exception("API error")
+
+    with pytest.raises(AnsibleConnectionFailure, match="Failed to fetch file"):
+        connection.fetch_file("/remote/path", "/local/path")
 
 
 def test_close(connection):
     """Test connection close."""
     connection._connected = True
     connection._proxmox = MagicMock()
+    connection._is_windows_guest = False
 
     connection.close()
 
     assert connection._connected is False
     assert connection._proxmox is None
+    assert connection._is_windows_guest is None
 
 
 @patch.object(qemu_module.time, "sleep")
@@ -539,3 +528,146 @@ def test_reset(mock_api, mock_sleep, connection):
 
     # After reset, should be connected again
     assert connection._connected is True
+
+
+@patch.object(qemu_module, "ProxmoxAPI")
+def test_detect_guest_os_windows(mock_api, connection):
+    """Test Windows detection via get-osinfo."""
+    mock_proxmox = MagicMock()
+    mock_api.return_value = mock_proxmox
+    connection._proxmox = mock_proxmox
+    connection.set_option("guest_os", "auto")
+
+    agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
+    agent("get-osinfo").get.return_value = {"result": {"id": "mswindows", "name": "Microsoft Windows"}}
+
+    assert connection._is_windows() is True
+    agent("get-osinfo").get.assert_called_once()
+
+
+@patch.object(qemu_module, "ProxmoxAPI")
+def test_detect_guest_os_posix(mock_api, connection):
+    """Test POSIX detection via get-osinfo."""
+    mock_proxmox = MagicMock()
+    mock_api.return_value = mock_proxmox
+    connection._proxmox = mock_proxmox
+    connection.set_option("guest_os", "auto")
+
+    agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
+    agent("get-osinfo").get.return_value = {"result": {"id": "linux", "name": "Ubuntu"}}
+
+    assert connection._is_windows() is False
+
+
+@patch.object(qemu_module, "ProxmoxAPI")
+def test_detect_guest_os_explicit_windows(mock_api, connection):
+    """Test explicit guest_os=windows skips detection."""
+    mock_proxmox = MagicMock()
+    mock_api.return_value = mock_proxmox
+    connection._proxmox = mock_proxmox
+    connection.set_option("guest_os", "windows")
+
+    assert connection._is_windows() is True
+    mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent.assert_not_called()
+
+
+@patch.object(qemu_module.time, "sleep")
+@patch.object(qemu_module, "ProxmoxAPI")
+def test_file_read_with_truncated(mock_api, mock_sleep, connection):
+    """Test _file_read returns content and truncated flag."""
+    mock_proxmox = MagicMock()
+    mock_api.return_value = mock_proxmox
+    connection._proxmox = mock_proxmox
+
+    agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
+    agent("file-read").get.return_value = {"content": "hello", "truncated": True}
+
+    content, truncated = connection._file_read("/tmp/test", offset=10, count=100)
+
+    assert content == b"hello"
+    assert truncated is True
+    agent("file-read").get.assert_called_once_with(file="/tmp/test", offset=10, count=100)
+
+
+@patch.object(qemu_module.time, "sleep")
+@patch.object(qemu_module, "ProxmoxAPI")
+def test_exec_command_windows_powershell(mock_api, mock_sleep, connection):
+    """Test command execution on Windows uses PowerShell."""
+    mock_proxmox = MagicMock()
+    mock_api.return_value = mock_proxmox
+
+    agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
+    agent.exec.post.return_value = {"pid": 42}
+    agent("exec-status").get.return_value = {"exited": 1, "exitcode": 0, "out-data": "", "err-data": ""}
+
+    connection._connected = True
+    connection._proxmox = mock_proxmox
+    connection._is_windows_guest = True
+
+    connection.exec_command("Get-Date")
+
+    agent.exec.post.assert_called_once_with(command=["powershell.exe", "-Command", "Get-Date"])
+
+
+@patch.object(qemu_module.time, "sleep")
+@patch.object(qemu_module, "ProxmoxAPI")
+def test_exec_command_windows_cmd(mock_api, mock_sleep, connection):
+    """Test command execution with guest_shell=cmd."""
+    mock_proxmox = MagicMock()
+    mock_api.return_value = mock_proxmox
+
+    agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
+    agent.exec.post.return_value = {"pid": 42}
+    agent("exec-status").get.return_value = {"exited": 1, "exitcode": 0, "out-data": "", "err-data": ""}
+
+    connection._connected = True
+    connection._proxmox = mock_proxmox
+    connection._is_windows_guest = True
+    connection.set_option("guest_shell", "cmd")
+
+    connection.exec_command("echo hello")
+
+    agent.exec.post.assert_called_once_with(command=["cmd.exe", "/c", "echo hello"])
+
+
+@patch.object(qemu_module.time, "sleep")
+@patch.object(qemu_module, "ProxmoxAPI")
+def test_put_file_chunked_windows(mock_api, mock_sleep, connection):
+    """Test chunked file upload on Windows uses PowerShell assembly."""
+    mock_proxmox = MagicMock()
+    mock_api.return_value = mock_proxmox
+    connection._connected = True
+    connection._proxmox = mock_proxmox
+    connection._is_windows_guest = True
+    connection.set_option("remote_tmp", r"C:\Windows\Temp")
+
+    agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
+    agent.exec.post.return_value = {"pid": 1}
+    agent("exec-status").get.return_value = {"exited": 1, "exitcode": 0, "out-data": "", "err-data": ""}
+
+    large_data = b"x" * 100000
+    with patch("builtins.open", mock_open(read_data=large_data)):
+        connection.put_file("/local/path", r"C:\dest\file")
+
+    # Should have written 3 chunks + assembly script
+    assert agent("file-write").post.call_count == 4  # noqa: PLR2004
+    # Should have run PowerShell assembly script and cleaned it up
+    assert agent.exec.post.call_count == 2  # noqa: PLR2004
+    assembly_call = agent.exec.post.call_args_list[0]
+    assert assembly_call[1]["command"][0] == "powershell.exe"
+    assert r"C:\Windows\Temp\.ansible_assemble.ps1" in assembly_call[1]["command"][2]
+
+
+def test_get_remote_tmp_windows(connection):
+    """Test default Windows temp path."""
+    connection.set_option("remote_tmp", None)
+    connection._is_windows_guest = True
+
+    assert connection._get_remote_tmp() == r"C:\Windows\Temp"
+
+
+def test_join_remote_path_windows(connection):
+    """Test Windows path joining."""
+    connection._is_windows_guest = True
+
+    assert connection._join_remote_path(r"C:\temp", "file.txt") == r"C:\temp\file.txt"

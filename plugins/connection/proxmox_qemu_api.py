@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 from __future__ import annotations
+import shlex
 
 DOCUMENTATION = r"""
 ---
@@ -14,7 +15,7 @@ description:
   - Requires the QEMU Guest Agent (C(qemu-guest-agent)) to be installed and running inside the target VM.
   - Talks directly to the Proxmox REST API using C(proxmoxer), avoiding the overhead and limitations
     of shelling out to C(qm guest exec) over SSH.
-  - Linux guests only. Windows guest support is not implemented.
+  - Supports Linux and Windows guests.
 author:
   - Ian Williams (@aph3rson)
 version_added: "2.0.0"
@@ -100,18 +101,42 @@ options:
       - name: proxmox_validate_certs
     env:
       - name: PROXMOX_VERIFY_SSL
+  guest_os:
+    description:
+      - Guest operating system family.
+      - When set to V(auto), the plugin queries the QEMU guest agent (C(get-osinfo))
+        during connection to detect Windows guests.
+      - Set explicitly to avoid the detection API call or when the API user lacks
+        permission for C(VM.GuestAgent.Audit).
+    choices: [auto, posix, windows]
+    default: auto
+    type: str
+    vars:
+      - name: proxmox_guest_os
+  guest_shell:
+    description:
+      - Shell family to use when invoking commands on the guest.
+      - V(auto) selects C(powershell) on detected Windows guests when O(guest_os=windows)
+        or when C(ansible_shell_type) is C(powershell), otherwise V(sh).
+      - Ignored when O(guest_os=posix).
+    choices: [auto, sh, powershell, cmd]
+    default: auto
+    type: str
+    vars:
+      - name: proxmox_guest_shell
   remote_tmp:
     description:
       - Temporary directory on the guest for staging chunked file transfers.
-      - Must be writable by the guest agent process (typically root).
+      - Must be writable by the guest agent process (root on Linux, SYSTEM on Windows).
       - Only used when transferring files larger than 45000 bytes.
-    default: /tmp
+      - If not set, V(/tmp) is used on POSIX guests and V(C:/Windows/Temp) on Windows guests.
     type: str
     vars:
       - name: proxmox_remote_tmp
   executable:
-    description: Shell executable for command execution on the guest.
-    default: /bin/sh
+    description:
+      - Shell executable for command execution on the guest.
+      - If not set, V(/bin/sh) is used on POSIX guests and V(powershell.exe) on Windows guests.
     type: str
     vars:
       - name: ansible_executable
@@ -133,15 +158,17 @@ notes:
     If the agent is not responsive, the connection will fail after O(connect_timeout) seconds.
   - File transfers use the PVE guest agent file-read/file-write API, which has a per-call
     size limit of approximately 45000 bytes. Files larger than this are automatically
-    split into chunks using C(split) on the guest and reassembled on the controller or guest.
-  - "Guest requirements: C(qemu-guest-agent) must be running. File transfers additionally
-    require C(cat), C(split), C(ls), and C(rm) (coreutils)."
+    split into chunks.
+  - "POSIX guest requirements: C(qemu-guest-agent) must be running."
+  - "Windows guest requirements: C(QEMU Guest Agent) must be running and PowerShell must be available."
+  - Windows detection uses the C(get-osinfo) guest agent command and requires
+    C(VM.GuestAgent.Audit) or C(VM.GuestAgent.Unrestricted).
   - Works with the C(community.proxmox.proxmox) inventory plugin. Set
     C(ansible_connection=community.proxmox.proxmox_qemu_api) on discovered hosts.
 """
 
 EXAMPLES = r"""
-- name: Static inventory example
+- name: Static inventory example (Linux guest)
   # inventory.yml
   # all:
   #   hosts:
@@ -171,6 +198,29 @@ EXAMPLES = r"""
     - name: Run a command
       ansible.builtin.command:
         cmd: systemctl restart app
+
+- name: Static inventory example (Windows guest)
+  # inventory.yml
+  # all:
+  #   hosts:
+  #     win-vm:
+  #       ansible_connection: community.proxmox.proxmox_qemu_api
+  #       ansible_shell_type: powershell
+  #       proxmox_vmid: 101
+  #       ansible_host: win-vm.example.com
+  #   vars:
+  #     proxmox_api_host: pve-1.example.com
+  #     proxmox_api_port: 8006
+  #     proxmox_api_token_id: automation@pve!ansible
+  #     proxmox_api_token_secret: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+  #     proxmox_node: pve-1
+  hosts: win-vm
+  gather_facts: true
+  tasks:
+    - name: Install a Windows feature
+      ansible.windows.win_feature:
+        name: Web-Server
+        state: present
 """
 
 import base64
@@ -180,6 +230,7 @@ import time
 from ansible.errors import AnsibleConnectionFailure, AnsibleError
 from ansible.plugins.connection import ConnectionBase
 from ansible.utils.display import Display
+from ansible.module_utils.common.text.converters import to_bytes
 
 from ansible_collections.community.proxmox.plugins.module_utils.proxmox import HAS_PROXMOXER
 
@@ -231,6 +282,7 @@ class Connection(ConnectionBase):
         super().__init__(*args, **kwargs)
         self._connected = False
         self._proxmox = None
+        self._is_windows_guest = None
         logging.captureWarnings(True)
 
     def _get_proxmox(self):
@@ -279,6 +331,60 @@ class Connection(ConnectionBase):
         vmid = self.get_option("vmid")
         return proxmox.nodes(node).qemu(vmid).agent
 
+    def _detect_guest_os(self):
+        """Detect whether the guest is Windows via get-osinfo."""
+        guest_os_option = self.get_option("guest_os")
+        if guest_os_option == "windows":
+            return True
+        if guest_os_option == "posix":
+            return False
+
+        result = self._agent()("get-osinfo").get()
+        os_info = result.get("result", {})
+        os_id = os_info.get("id", "").lower()
+        return os_id == "mswindows"
+
+    def _is_windows(self):
+        if self._is_windows_guest is None:
+            self._is_windows_guest = self._detect_guest_os()
+            display.vvv(
+                f"Guest OS on VM {self.get_option('vmid')} detected as "
+                f"{'Windows' if self._is_windows_guest else 'POSIX'}"
+            )
+        return self._is_windows_guest
+
+    def _get_remote_tmp(self):
+        remote_tmp = self.get_option("remote_tmp")
+        if remote_tmp:
+            return remote_tmp
+        if self._is_windows():
+            return r"C:\Windows\Temp"
+        return "/tmp"
+
+    def _join_remote_path(self, *parts):
+        if self._is_windows():
+            return "\\".join(p.rstrip("\\") for p in parts)
+        return "/".join(p.rstrip("/") for p in parts)
+
+    def _get_shell_config(self):
+        """Return (shell_executable, shell_argument) for exec_command."""
+        guest_shell = self.get_option("guest_shell")
+        executable = self.get_option("executable")
+
+        shell_family = None
+        if guest_shell != "auto":
+            shell_family = guest_shell
+        elif getattr(self._shell, "SHELL_FAMILY", None) == "powershell" or self._is_windows():
+            shell_family = "powershell"
+        else:
+            shell_family = "sh"
+
+        if shell_family == "powershell":
+            return executable or "powershell.exe", "-Command"
+        if shell_family == "cmd":
+            return executable or "cmd.exe", "/c"
+        return executable or "/bin/sh", "-c"
+
     def _connect(self):
         if self._connected:
             return self
@@ -293,7 +399,7 @@ class Connection(ConnectionBase):
                 self._agent().ping.post()
                 self._connected = True
                 display.vvv(f"QEMU guest agent responsive on VM {self.get_option('vmid')}")
-                return self
+                break
             except Exception as e:
                 if attempt < attempts - 1:
                     display.vvv(
@@ -307,24 +413,44 @@ class Connection(ConnectionBase):
                         f"after {timeout}s. Is qemu-guest-agent installed and running?"
                     ) from None
 
+        # Best-effort OS detection once the agent responds. Detection failures are
+        # logged and treated as POSIX so the connection can still proceed.
+        try:
+            self._is_windows()
+        except Exception as exc:
+            display.vvv(f"Guest OS detection failed on VM {self.get_option('vmid')}, assuming POSIX: {exc}")
+            self._is_windows_guest = False
+
+        return self
+
     def exec_command(self, cmd, in_data=None, sudoable=True):
         super().exec_command(cmd, in_data=in_data, sudoable=sudoable)
         self._connect()
 
-        shell = self.get_option("executable")
+        shell, shell_arg = self._get_shell_config()
         display.vvv(f"EXEC via guest agent: {cmd}")
 
         try:
-            data = self._agent().exec.post(command=[shell, "-c", cmd])
+            data = self._agent().exec.post(command=[shell, shell_arg, cmd])
         except Exception as exc:
             raise AnsibleConnectionFailure(f"Failed to execute command on VM {self.get_option('vmid')}: {exc}") from exc
 
         pid = data["pid"]
-        status = self._poll_exec_status(pid)
+        try:
+            status = self._poll_exec_status(pid)
+        except Exception as exc:
+            raise AnsibleConnectionFailure(
+                f"Failed to poll command status on VM {self.get_option('vmid')}: {exc}"
+            ) from exc
 
         rc = status.get("exitcode", -1)
         stdout = status.get("out-data", "")
         stderr = status.get("err-data", "")
+        display.vvv(
+            f"EXEC result on VM {self.get_option('vmid')}: rc={rc}, stdout={len(stdout)} bytes, stderr={len(stderr)} bytes, peek[stdout]={stdout[:100]!r}, peek[stderr]={stderr[:100]!r}"
+        )
+        stdout = to_bytes(stdout)
+        stderr = to_bytes(stderr)
         return rc, stdout, stderr
 
     def _poll_exec_status(self, pid):
@@ -364,64 +490,80 @@ class Connection(ConnectionBase):
         self._put_file_chunked(raw, out_path)
 
     def _put_file_chunked(self, raw, out_path):
-        remote_tmp = self.get_option("remote_tmp")
+        remote_tmp = self._get_remote_tmp()
         parts = []
         for i in range(0, len(raw), FILE_WRITE_CHUNK):
-            part_path = f"{remote_tmp}/.ansible_part_{i}"
+            part_path = self._join_remote_path(remote_tmp, f".ansible_part_{i:06d}")
             parts.append(part_path)
             self._file_write(part_path, raw[i : i + FILE_WRITE_CHUNK])
 
-        cat_cmd = "cat " + " ".join(parts) + f" > {out_path} && rm -f " + " ".join(parts)
-        rc, dummy_stdout, err = self.exec_command(cat_cmd)
+        if self._is_windows():
+            rc, dummy_stdout, err = self._assemble_file_windows(parts, out_path)
+        else:
+            rc, dummy_stdout, err = self._assemble_file_posix(parts, out_path)
+
         if rc != 0:
             raise AnsibleConnectionFailure(f"Failed to assemble chunked file on VM {self.get_option('vmid')}: {err}")
 
-    def _file_read(self, guest_path):
+    def _assemble_file_posix(self, parts, out_path):
+        cat_cmd = "cat " + " ".join(parts) + f" > {out_path} && rm -f " + " ".join(parts)
+        return self.exec_command(cat_cmd)
+
+    def _assemble_file_windows(self, parts, out_path):
+        script = f"""$ProgressPreference = 'SilentlyContinue'
+$VerbosePreference = 'SilentlyContinue'
+$WarningPreference = 'SilentlyContinue'
+$null = New-Item -Path '{out_path}' -ItemType File -Force
+Get-Content -Raw {", ".join(shlex.quote(part) for part in parts)} | Set-Content -NoNewline '{out_path}'
+$null = Remove-Item -Force {", ".join(shlex.quote(part) for part in parts)}
+"""
+        # script_path = self._join_remote_path(remote_tmp, ".ansible_assemble.ps1")
+        encoded_script = base64.b64encode(script.encode("utf-16-le")).decode()
+        try:
+            return self.exec_command(
+                f"PowerShell -NoProfile -NonInteractive -ExecutionPolicy Unrestricted -EncodedCommand {encoded_script}"
+            )
+        finally:
+            pass
+
+    def _file_read(self, guest_path, offset=0, count=None):
         """Read a file from the guest via file-read API.
 
         PVE encodes raw file bytes as JSON unicode escapes (\\u00XX),
         which json.loads turns into a Python str with code points 0x00-0xFF.
         latin-1 is the exact inverse: U+00NN -> byte 0xNN, preserving binary content.
         """
-        result = self._agent()("file-read").get(file=guest_path)
+        kwargs = {"file": guest_path, "offset": offset}
+        if count is not None:
+            kwargs["count"] = count
+        result = self._agent()("file-read").get(**kwargs)
         content = result.get("content", "")
-        return content.encode("latin-1")
+        truncated = result.get("truncated", False)
+        return content.encode("latin-1"), truncated
 
     def fetch_file(self, in_path, out_path):
         super().fetch_file(in_path, out_path)
         self._connect()
         display.vvv(f"FETCH {in_path} -> {out_path} via guest agent")
 
-        remote_tmp = self.get_option("remote_tmp")
-        prefix = f"{remote_tmp}/.ansible_fetch_"
-
-        # Split file into chunks on guest, read each chunk, append locally
-        split_cmd = f"split -b {FILE_WRITE_CHUNK} -- {in_path} {prefix}"
-        rc, dummy_stdout, err = self.exec_command(split_cmd)
-        if rc != 0:
-            raise AnsibleConnectionFailure(f"Failed to split file {in_path} on VM {self.get_option('vmid')}: {err}")
-
-        # List the chunk files in order
-        rc, stdout, err = self.exec_command(f"ls -1 {prefix}* 2>/dev/null")
-        if rc != 0:
-            raise AnsibleConnectionFailure(
-                f"Failed to list chunks for {in_path} on VM {self.get_option('vmid')}: {err}"
-            )
-
-        parts = stdout.strip().split("\n") if stdout.strip() else []
-
         try:
             with open(out_path, "wb") as f:
-                for part in parts:
-                    chunk = self._file_read(part.strip())
+                offset = 0
+                while True:
+                    chunk, truncated = self._file_read(in_path, offset=offset, count=FILE_WRITE_CHUNK)
                     f.write(chunk)
-        finally:
-            if parts:
-                self.exec_command(f"rm -f {prefix}*")
+                    if not truncated:
+                        break
+                    offset += len(chunk)
+        except Exception as exc:
+            raise AnsibleConnectionFailure(
+                f"Failed to fetch file {in_path} from VM {self.get_option('vmid')}: {exc}"
+            ) from exc
 
     def close(self):
         self._proxmox = None
         self._connected = False
+        self._is_windows_guest = None
         super().close()
 
     def reset(self):

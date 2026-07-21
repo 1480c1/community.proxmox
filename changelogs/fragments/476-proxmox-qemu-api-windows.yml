@@ -1,0 +1,4 @@
+minor_changes:
+  - proxmox_qemu_api - add support for Windows guests. The plugin auto-detects
+    the guest OS via the QEMU guest agent ``get-osinfo`` command and uses
+    PowerShell or cmd for command execution and file transfers.
