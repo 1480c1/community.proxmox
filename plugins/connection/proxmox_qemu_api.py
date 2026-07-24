@@ -148,6 +148,14 @@ options:
     type: int
     vars:
       - name: proxmox_connect_timeout
+  api_timeout:
+    description:
+      - Maximum number of seconds to wait for Proxmox API calls to complete.
+      - Applies to all API calls made by the plugin, including guest agent commands and file transfers.
+    default: 5
+    type: int
+    vars:
+      - name: proxmox_api_timeout
 notes:
   - The API user or token requires guest agent privileges on the target VM.
     On PVE 8, this is C(VM.Monitor). On PVE 9+, C(VM.Monitor) was replaced with
@@ -300,6 +308,7 @@ class Connection(ConnectionBase):
         token_secret = self.get_option("api_token_secret")
         user = self.get_option("api_user")
         password = self.get_option("api_password")
+        timeout = self.get_option("api_timeout")
 
         if user and token_id and token_secret:
             self._proxmox = ProxmoxAPI(
@@ -309,6 +318,7 @@ class Connection(ConnectionBase):
                 token_name=token_id,
                 token_value=token_secret,
                 verify_ssl=verify_ssl,
+                timeout=timeout,
             )
         elif user and password:
             self._proxmox = ProxmoxAPI(
@@ -317,6 +327,7 @@ class Connection(ConnectionBase):
                 user=user,
                 password=password,
                 verify_ssl=verify_ssl,
+                timeout=timeout
             )
         else:
             raise AnsibleConnectionFailure(
@@ -410,7 +421,7 @@ class Connection(ConnectionBase):
                 else:
                     raise AnsibleConnectionFailure(
                         f"QEMU guest agent is not responding on VM {self.get_option('vmid')} "
-                        f"after {timeout}s. Is qemu-guest-agent installed and running?"
+                        f"after {timeout}s. Is qemu-guest-agent installed and running? got error: {e}"
                     ) from None
 
         # Best-effort OS detection once the agent responds. Detection failures are
