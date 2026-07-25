@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 from __future__ import annotations
+
 import shlex
 
 DOCUMENTATION = r"""
@@ -238,9 +239,9 @@ import logging
 import time
 
 from ansible.errors import AnsibleConnectionFailure, AnsibleError
+from ansible.module_utils.common.text.converters import to_bytes
 from ansible.plugins.connection import ConnectionBase
 from ansible.utils.display import Display
-from ansible.module_utils.common.text.converters import to_bytes
 
 from ansible_collections.community.proxmox.plugins.module_utils.proxmox import HAS_PROXMOXER
 
@@ -279,6 +280,8 @@ for _name in ("urllib3", "requests", "py.warnings"):
 # https://forum.proxmox.com/threads/maximum-file-upload-size-for-qemu-agent-file-write.166200/
 FILE_WRITE_CHUNK = 45000
 FILE_WRITE_RETRIES = 5
+POLL_RETRIES = 5
+POLL_RETRY_DELAY = 2
 
 # The QEMU guest agent starts processes without a login environment, so HOME is
 # unset. POSIX sh (dash) then leaves ``~`` unexpanded, which breaks ansible-core's
@@ -332,12 +335,7 @@ class Connection(ConnectionBase):
             )
         elif user and password:
             self._proxmox = ProxmoxAPI(
-                host,
-                port=port,
-                user=user,
-                password=password,
-                verify_ssl=verify_ssl,
-                timeout=timeout
+                host, port=port, user=user, password=password, verify_ssl=verify_ssl, timeout=timeout
             )
         else:
             raise AnsibleConnectionFailure(
@@ -451,16 +449,29 @@ class Connection(ConnectionBase):
         shell, shell_arg = self._get_shell_config()
         display.vvv(f"EXEC via guest agent: {cmd}")
 
-        try:
-            data = self._agent().exec.post(
-                command=[
-                    shell,
-                    shell_arg,
-                    (HOME_GUARD if self._is_windows_guest else "") + cmd,
-                ]
-            )
-        except Exception as exc:
-            raise AnsibleConnectionFailure(f"Failed to execute command on VM {self.get_option('vmid')}: {exc}") from exc
+        retries = 0
+        while True:
+            try:
+                data = self._agent().exec.post(
+                    command=[
+                        shell,
+                        shell_arg,
+                        (HOME_GUARD if not self._is_windows_guest else "") + cmd,
+                    ]
+                )
+                break
+            except Exception as exc:
+                if retries < POLL_RETRIES:
+                    retries += 1
+                    display.vvv(
+                        f"Execute command on VM {self.get_option('vmid')} failed, "
+                        f"retrying ({retries}/{POLL_RETRIES}): {exc}"
+                    )
+                    time.sleep(POLL_RETRY_DELAY)
+                else:
+                    raise AnsibleConnectionFailure(
+                        f"Failed to execute command on VM {self.get_option('vmid')}: {exc}"
+                    ) from exc
 
         pid = data["pid"]
         try:
@@ -481,9 +492,21 @@ class Connection(ConnectionBase):
         return rc, stdout, stderr
 
     def _poll_exec_status(self, pid):
+        retries = 0
         while True:
             time.sleep(0.5)
-            status = self._agent()("exec-status").get(pid=pid)
+            try:
+                status = self._agent()("exec-status").get(pid=pid)
+            except Exception as e:
+                if retries < POLL_RETRIES:
+                    retries += 1
+                    display.vvv(
+                        f"Poll command status on VM {self.get_option('vmid')} failed, "
+                        f"retrying ({retries}/{POLL_RETRIES}): {e}"
+                    )
+                    time.sleep(POLL_RETRY_DELAY)
+                    continue
+                raise
             if status.get("exited"):
                 return status
 

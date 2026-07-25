@@ -353,6 +353,44 @@ def test_poll_exec_status_waits(mock_api, mock_sleep, connection):
 
 @patch.object(qemu_module.time, "sleep")
 @patch.object(qemu_module, "ProxmoxAPI")
+def test_poll_exec_status_retries_on_connection_error(mock_api, mock_sleep, connection):
+    """Test that _poll_exec_status retries on transient connection errors."""
+    mock_proxmox = MagicMock()
+    mock_api.return_value = mock_proxmox
+    connection._proxmox = mock_proxmox
+
+    agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
+    agent("exec-status").get.side_effect = [
+        ConnectionResetError("Connection reset by peer"),
+        ConnectionResetError("Connection reset by peer"),
+        {"exited": 1, "exitcode": 0, "out-data": "done"},
+    ]
+
+    status = connection._poll_exec_status(42)
+
+    assert status["out-data"] == "done"
+    assert agent("exec-status").get.call_count == 3  # noqa: PLR2004
+
+
+@patch.object(qemu_module.time, "sleep")
+@patch.object(qemu_module, "ProxmoxAPI")
+def test_poll_exec_status_retries_exhausted_raises(mock_api, mock_sleep, connection):
+    """Test that _poll_exec_status raises AnsibleConnectionFailure after exhausting retries."""
+    mock_proxmox = MagicMock()
+    mock_api.return_value = mock_proxmox
+    connection._proxmox = mock_proxmox
+
+    agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
+    agent("exec-status").get.side_effect = ConnectionResetError("Connection reset by peer")
+
+    with pytest.raises(AnsibleConnectionFailure, match="Failed to poll command status"):
+        connection._poll_exec_status(42)
+
+    assert agent("exec-status").get.call_count == qemu_module.POLL_RETRIES + 1  # noqa: PLR2004
+
+
+@patch.object(qemu_module.time, "sleep")
+@patch.object(qemu_module, "ProxmoxAPI")
 def test_file_write_success(mock_api, mock_sleep, connection):
     """Test successful file write."""
     mock_proxmox = MagicMock()
