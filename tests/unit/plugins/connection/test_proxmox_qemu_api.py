@@ -353,29 +353,8 @@ def test_poll_exec_status_waits(mock_api, mock_sleep, connection):
 
 @patch.object(qemu_module.time, "sleep")
 @patch.object(qemu_module, "ProxmoxAPI")
-def test_poll_exec_status_retries_on_connection_error(mock_api, mock_sleep, connection):
-    """Test that _poll_exec_status retries on transient connection errors."""
-    mock_proxmox = MagicMock()
-    mock_api.return_value = mock_proxmox
-    connection._proxmox = mock_proxmox
-
-    agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
-    agent("exec-status").get.side_effect = [
-        ConnectionResetError("Connection reset by peer"),
-        ConnectionResetError("Connection reset by peer"),
-        {"exited": 1, "exitcode": 0, "out-data": "done"},
-    ]
-
-    status = connection._poll_exec_status(42)
-
-    assert status["out-data"] == "done"
-    assert agent("exec-status").get.call_count == 3  # noqa: PLR2004
-
-
-@patch.object(qemu_module.time, "sleep")
-@patch.object(qemu_module, "ProxmoxAPI")
-def test_poll_exec_status_retries_exhausted_raises(mock_api, mock_sleep, connection):
-    """Test that _poll_exec_status raises AnsibleConnectionFailure after exhausting retries."""
+def test_poll_exec_status_does_not_retry_connection_error(mock_api, mock_sleep, connection):
+    """Test that a failed status request is not repeated."""
     mock_proxmox = MagicMock()
     mock_api.return_value = mock_proxmox
     connection._proxmox = mock_proxmox
@@ -383,10 +362,29 @@ def test_poll_exec_status_retries_exhausted_raises(mock_api, mock_sleep, connect
     agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
     agent("exec-status").get.side_effect = ConnectionResetError("Connection reset by peer")
 
-    with pytest.raises(AnsibleConnectionFailure, match="Failed to poll command status"):
+    with pytest.raises(AnsibleConnectionFailure, match="the request may have completed, so it was not retried"):
         connection._poll_exec_status(42)
 
-    assert agent("exec-status").get.call_count == qemu_module.POLL_RETRIES + 1  # noqa: PLR2004
+    agent("exec-status").get.assert_called_once_with(pid=42)
+    mock_sleep.assert_called_once_with(0.5)
+
+
+@patch.object(qemu_module.time, "sleep")
+@patch.object(qemu_module, "ProxmoxAPI")
+def test_poll_exec_status_does_not_retry_missing_pid(mock_api, mock_sleep, connection):
+    """Test that an unknown guest-exec PID is treated as terminal."""
+    mock_proxmox = MagicMock()
+    mock_api.return_value = mock_proxmox
+    connection._proxmox = mock_proxmox
+
+    agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
+    agent("exec-status").get.side_effect = Exception("500 Internal Server Error: Agent error: PID lld does not exist")
+
+    with pytest.raises(AnsibleConnectionFailure, match="the command result is unknown"):
+        connection._poll_exec_status(42)
+
+    agent("exec-status").get.assert_called_once_with(pid=42)
+    mock_sleep.assert_called_once_with(0.5)
 
 
 @patch.object(qemu_module.time, "sleep")
@@ -421,6 +419,71 @@ def test_file_write_retries(mock_api, mock_sleep, connection):
     connection._file_write("/tmp/test", b"hello")
 
     assert agent("file-write").post.call_count == 3  # noqa: PLR2004
+
+
+@patch.object(qemu_module.time, "sleep")
+@patch.object(qemu_module, "ProxmoxAPI")
+def test_file_write_retries_windows_lock(mock_api, mock_sleep, connection):
+    """Test that a small-file lock retains the ordinary retry behavior."""
+    mock_proxmox = MagicMock()
+    mock_api.return_value = mock_proxmox
+    connection._proxmox = mock_proxmox
+    connection._is_windows_guest = True
+
+    agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
+    agent("file-write").post.side_effect = [
+        Exception("The process cannot access the file because it is being used by another process"),
+        None,
+    ]
+
+    connection._file_write("/tmp/test", b"hello")
+
+    assert agent("file-write").post.call_count == 2  # noqa: PLR2004
+    mock_sleep.assert_called_once_with(5)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "The process cannot access the file because it is being used by another process",
+        "ERROR_SHARING_VIOLATION (WinError 32)",
+        "ERROR_LOCK_VIOLATION: 0x80070021",
+    ],
+)
+def test_is_windows_file_lock_error(message):
+    """Test recognition of Windows sharing and lock violations."""
+    assert qemu_module.Connection._is_windows_file_lock_error(Exception(message))
+
+
+def test_is_windows_file_lock_error_rejects_other_errors():
+    """Test that unrelated failures do not trigger guest-agent recovery."""
+    assert not qemu_module.Connection._is_windows_file_lock_error(Exception("Access is denied"))
+
+
+def test_is_windows_file_lock_error_checks_response_details():
+    """Test that Windows lock errors in an HTTP response are recognized."""
+    error = Exception("Proxmox API request failed")
+    error.response = MagicMock(text="ERROR_SHARING_VIOLATION", content=b"")
+
+    assert qemu_module.Connection._is_windows_file_lock_error(error)
+
+
+@patch.object(qemu_module.time, "sleep")
+@patch.object(qemu_module, "ProxmoxAPI")
+def test_file_write_retries_non_lock_errors(mock_api, mock_sleep, connection):
+    """Test that non-lock failures retain the ordinary retry behavior."""
+    mock_proxmox = MagicMock()
+    mock_api.return_value = mock_proxmox
+    connection._proxmox = mock_proxmox
+    connection._is_windows_guest = True
+
+    agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
+    agent("file-write").post.side_effect = [Exception("temporary API failure"), None]
+
+    connection._file_write("/tmp/test", b"hello")
+
+    assert agent("file-write").post.call_count == 2  # noqa: PLR2004
+    mock_sleep.assert_called_once_with(5)
 
 
 @patch.object(qemu_module.time, "sleep")
@@ -498,7 +561,64 @@ def test_put_file_chunked_uses_remote_tmp(mock_api, mock_sleep, connection):
     # Check that the cat command references /var/tmp with zero-padded part names
     exec_call = agent.exec.post.call_args
     cmd = exec_call[1]["command"][2]
-    assert "/var/tmp/.ansible_part_000000" in cmd
+    assert "/var/tmp/.ansible_part_" in cmd
+    assert "_000000" in cmd
+
+
+@patch.object(qemu_module, "ProxmoxAPI")
+def test_put_file_chunked_uses_unique_part_names_per_transfer(mock_api, connection):
+    """Test that chunk names do not collide across failed or repeated transfers."""
+    mock_proxmox = MagicMock()
+    mock_api.return_value = mock_proxmox
+    connection._connected = True
+    connection._proxmox = mock_proxmox
+
+    agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
+    agent.exec.post.return_value = {"pid": 1}
+    agent("exec-status").get.return_value = {
+        "exited": 1,
+        "exitcode": 0,
+        "out-data": "",
+        "err-data": "",
+    }
+
+    connection._put_file_chunked(b"x" * 50000, "/remote/path")
+    connection._put_file_chunked(b"x" * 50000, "/remote/path")
+
+    part_paths = [call.kwargs["file"] for call in agent("file-write").post.call_args_list]
+    assert len(part_paths) == 4  # noqa: PLR2004
+    assert set(part_paths[:2]).isdisjoint(part_paths[2:])
+
+
+@patch.object(qemu_module.time, "sleep")
+@patch.object(qemu_module, "ProxmoxAPI")
+def test_put_file_chunked_retries_locked_chunk_with_new_path(mock_api, mock_sleep, connection):
+    """Test that a locked temporary chunk is retried using a fresh path."""
+    mock_proxmox = MagicMock()
+    mock_api.return_value = mock_proxmox
+    connection._connected = True
+    connection._proxmox = mock_proxmox
+    connection._is_windows_guest = True
+    connection.set_option("remote_tmp", r"C:\Windows\Temp")
+
+    agent = mock_proxmox.nodes("pve-1").qemu(TEST_VMID).agent
+    agent("file-write").post.side_effect = [
+        Exception("The process cannot access the file because it is being used by another process"),
+        None,
+        None,
+    ]
+
+    with patch.object(connection, "_assemble_file_windows", return_value=(0, b"", b"")) as assemble:
+        connection._put_file_chunked(b"x" * 50000, r"C:\remote\path")
+
+    part_paths = [write.kwargs["file"] for write in agent("file-write").post.call_args_list]
+    assert len(part_paths) == 3  # noqa: PLR2004
+    assert part_paths[0].endswith("_000000_00")
+    assert part_paths[1].endswith("_000000_01")
+    assert part_paths[2].endswith("_045000_00")
+    assert part_paths[0] != part_paths[1]
+    assemble.assert_called_once_with(part_paths[1:], r"C:\remote\path")
+    mock_sleep.assert_called_once_with(qemu_module.POLL_RETRY_DELAY)
 
 
 @patch.object(qemu_module.time, "sleep")

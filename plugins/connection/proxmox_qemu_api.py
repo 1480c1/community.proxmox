@@ -237,6 +237,7 @@ EXAMPLES = r"""
 import base64
 import logging
 import time
+import uuid
 
 from ansible.errors import AnsibleConnectionFailure, AnsibleError
 from ansible.module_utils.common.text.converters import to_bytes
@@ -290,6 +291,10 @@ POLL_RETRY_DELAY = 2
 # child process it spawns, including ansible-core's inner ``/bin/sh -c`` wrapper and
 # the Python module interpreter.
 HOME_GUARD = 'export HOME="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"; '
+
+
+class _FileWriteLockError(AnsibleConnectionFailure):
+    """Signal a locked chunk path so the caller can retry with a new path."""
 
 
 class Connection(ConnectionBase):
@@ -476,6 +481,8 @@ class Connection(ConnectionBase):
         pid = data["pid"]
         try:
             status = self._poll_exec_status(pid)
+        except AnsibleConnectionFailure:
+            raise
         except Exception as exc:
             raise AnsibleConnectionFailure(
                 f"Failed to poll command status on VM {self.get_option('vmid')}: {exc}"
@@ -492,38 +499,79 @@ class Connection(ConnectionBase):
         return rc, stdout, stderr
 
     def _poll_exec_status(self, pid):
-        retries = 0
         while True:
             time.sleep(0.5)
             try:
                 status = self._agent()("exec-status").get(pid=pid)
-            except Exception as e:
-                if retries < POLL_RETRIES:
-                    retries += 1
-                    display.vvv(
-                        f"Poll command status on VM {self.get_option('vmid')} failed, "
-                        f"retrying ({retries}/{POLL_RETRIES}): {e}"
-                    )
-                    time.sleep(POLL_RETRY_DELAY)
-                    continue
-                raise
+            except Exception as exc:
+                if self._is_guest_exec_pid_missing_error(exc):
+                    raise AnsibleConnectionFailure(
+                        f"QEMU guest agent no longer tracks command PID {pid} on VM {self.get_option('vmid')}; "
+                        f"the command result is unknown and cannot be safely retried: {exc}"
+                    ) from exc
+                raise AnsibleConnectionFailure(
+                    f"Failed to poll command status for PID {pid} on VM {self.get_option('vmid')}; "
+                    f"the request may have completed, so it was not retried: {exc}"
+                ) from exc
             if status.get("exited"):
                 return status
 
-    def _file_write(self, guest_path, data_bytes):
+    @staticmethod
+    def _is_guest_exec_pid_missing_error(exc):
+        response = getattr(exc, "response", None)
+        details = [
+            str(exc),
+            str(getattr(exc, "content", "")),
+            str(getattr(response, "text", "")),
+            str(getattr(response, "content", "")),
+        ]
+        error_text = " ".join(details).casefold()
+        return "pid " in error_text and " does not exist" in error_text
+
+    @staticmethod
+    def _is_windows_file_lock_error(exc):
+        response = getattr(exc, "response", None)
+        details = [
+            str(exc),
+            str(getattr(exc, "content", "")),
+            str(getattr(response, "text", "")),
+            str(getattr(response, "content", "")),
+        ]
+        error_text = " ".join(details).casefold()
+        return any(
+            message in error_text
+            for message in (
+                "being used by another process",
+                "sharing violation",
+                "error_sharing_violation",
+                "winerror 32",
+                "0x80070020",
+                "lock violation",
+                "error_lock_violation",
+                "winerror 33",
+                "0x80070021",
+            )
+        )
+
+    def _file_write(self, guest_path, data_bytes, retry_lock_error=True):
         encoded = base64.b64encode(data_bytes).decode("ascii")
         for attempt in range(FILE_WRITE_RETRIES + 1):
             try:
                 self._agent()("file-write").post(file=guest_path, content=encoded, encode=0)
                 return
-            except Exception:
+            except Exception as exc:
+                if not retry_lock_error and self._is_windows() and self._is_windows_file_lock_error(exc):
+                    raise _FileWriteLockError(
+                        f"Failed to write file {guest_path} on VM {self.get_option('vmid')}: {exc}"
+                    ) from exc
+
                 if attempt < FILE_WRITE_RETRIES:
                     time.sleep(5)
                 else:
                     raise AnsibleConnectionFailure(
                         f"Failed to write file {guest_path} on VM {self.get_option('vmid')} "
-                        f"after {FILE_WRITE_RETRIES + 1} attempts"
-                    ) from None
+                        f"after {FILE_WRITE_RETRIES + 1} attempts: {exc}"
+                    ) from exc
 
     def put_file(self, in_path, out_path):
         super().put_file(in_path, out_path)
@@ -541,11 +589,31 @@ class Connection(ConnectionBase):
 
     def _put_file_chunked(self, raw, out_path):
         remote_tmp = self._get_remote_tmp()
+        transfer_id = uuid.uuid4().hex
         parts = []
         for i in range(0, len(raw), FILE_WRITE_CHUNK):
-            part_path = self._join_remote_path(remote_tmp, f".ansible_part_{i:06d}")
-            parts.append(part_path)
-            self._file_write(part_path, raw[i : i + FILE_WRITE_CHUNK])
+            chunk = raw[i : i + FILE_WRITE_CHUNK]
+            for attempt in range(FILE_WRITE_RETRIES + 1):
+                part_path = self._join_remote_path(
+                    remote_tmp,
+                    f".ansible_part_{transfer_id}_{i:06d}_{attempt:02d}",
+                )
+                try:
+                    self._file_write(part_path, chunk, retry_lock_error=False)
+                except _FileWriteLockError as exc:
+                    if attempt == FILE_WRITE_RETRIES:
+                        raise AnsibleConnectionFailure(
+                            f"Failed to write chunk at offset {i} on VM {self.get_option('vmid')} "
+                            f"after {FILE_WRITE_RETRIES + 1} unique temporary paths: {exc}"
+                        ) from exc
+                    display.vvv(
+                        f"Temporary chunk {part_path} is locked on VM {self.get_option('vmid')}; "
+                        f"retrying with a new path ({attempt + 1}/{FILE_WRITE_RETRIES})"
+                    )
+                    time.sleep(POLL_RETRY_DELAY)
+                else:
+                    parts.append(part_path)
+                    break
 
         if self._is_windows():
             rc, dummy_stdout, err = self._assemble_file_windows(parts, out_path)
